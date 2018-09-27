@@ -3,6 +3,9 @@ git:
 language: c
 os: linux
 sudo: false
+branches:
+    only:
+        - /^v.*$/
 addons:
     apt:
         packages:
@@ -38,8 +41,9 @@ deploy:
   provider: releases
   api_key:
     secure: Xpo6ocj3p5sE0a9/kEYBQZ5jM8u8i1XDcmJO6OGUJwSfqESVHm5smyZPm3aj/XGyUYltjz0Zh7NHZkmbBcxIlPobmrKANFICZHrf5bAKs52+PB8fjY0ly5ZByT0pfqrmMbw41b7YNAIgaAuUR8LXjo2KHyXYMwI221GfCfZSb70RFmoee1jM2e4yzeC7R4DJm33Zg/aU8hYF/6AKNuPKM59we+MbFaQwN74EjHQcz+cN7wrcuQfp/SLwFN0FgjxMY1hQyOoMtBDp/9jBH4I6xrrzQ2AEJibZNKxieYjcnIUhdQzU1Alu+UeaW/+9XKeXvJ/MIrlLUQhUJ49NYg9WCcAF/Me7+nH34GxuJIG9mTKC00H85QR7At7F7XdsDTvjrRXqU9WRQz/vPFyAA2uKueCYWKAr8j3bqcXIWqECPmlcEHJnbfVJmCa87azJ5xSN6988ZXsAPirl10zX99jx4VAE0zWnWgWbBuSCwdcgvH99iJWPJk5rHqydSocoXP1aJTGoLP5I1vQTObEqpe4ZChHqoXZc/4yQ3CS9t9/IfSQyRB1bLfe9gQs7TtR3DvXyyP+jGqZ3s708ivahRbJQ5xmmAk6C6BYcKTcUs9pMfTuN5v9DWhLYSr+vCbRjgqov1H36n33vHVs6r/iT13wyNxp9ox2qaYN5yRh/H117oKw=
+  file_glob: true
   file: 
-    - build/linux-*.deb
+    - ${CACHE}/../linux-*.deb
   skip_cleanup: true
   on:
     tags: true
