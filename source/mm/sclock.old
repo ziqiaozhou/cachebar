@@ -1,0 +1,293 @@
+#include<linux/pid_namespace.h>
+#include<linux/list.h>
+#include<linux/myservice.h>
+#include<linux/mm_types.h>
+#include<linux/sched.h>
+#include <linux/spinlock.h>
+#include <linux/jhash.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include<linux/kernel.h>
+#include<linux/list.h>
+#include <linux/freezer.h>
+#include <linux/mm.h>
+#include <linux/rmap.h>
+#include <linux/pagemap.h>
+#include <linux/bitops.h>
+#include <linux/hugetlb.h>
+#include <asm/pgtable.h>
+#include <asm/page.h>
+#include <linux/mmu_notifier.h>
+#include <asm/tlbflush.h>
+#include "internal.h"
+#include <linux/swap.h>
+#include <linux/ksm.h>
+#include <linux/list_sort.h>
+#include <linux/rbtree.h>
+#include <linux/pagemap.h>
+#include <linux/bitops.h>
+#include <linux/swap.h>
+#include <linux/cred.h>
+#include <linux/rculist.h>
+struct stable_node {
+	union {
+		struct rb_node node;	/* when node of stable tree */
+		struct {		/* when listed for migration */
+			struct list_head *head;
+			struct list_head list;
+		};
+	};
+	struct hlist_head hlist;
+	unsigned long kpfn;
+#ifdef CONFIG_NUMA
+	int nid;
+#endif
+};
+/**
+ * struct rmap_item - reverse mapping item for virtual addresses
+ * @rmap_list: next rmap_item in mm_slot's singly-linked rmap_list
+ * @anon_vma: pointer to anon_vma for this mm,address, when in stable tree
+ * @nid: NUMA node id of unstable tree in which linked (may not match page)
+ * @mm: the memory structure this rmap_item is pointing into
+ * @address: the virtual address this rmap_item tracks (+ flags in low bits)
+ * @oldchecksum: previous checksum of the page at that virtual address
+ * @node: rb node of this rmap_item in the unstable tree
+ * @head: pointer to stable_node heading this list in the stable tree
+ * @hlist: link into hlist of rmap_items hanging off that stable_node
+ **/
+struct rmap_item {
+	struct rmap_item *rmap_list;
+	union {
+		struct anon_vma *anon_vma;	/* when stable */
+#ifdef CONFIG_NUMA
+		int nid;		/* when node of unstable tree */
+#endif
+	};
+	struct mm_struct *mm;
+	unsigned long address;		/* + low bits used for flags below */
+	unsigned int oldchecksum;	/* when unstable */
+	union {
+		struct rb_node node;	/* when node of unstable tree */
+		struct {		/* when listed from stable tree */
+			struct stable_node *head;
+			struct hlist_node hlist;		};
+	};
+};
+
+
+
+extern struct list_head all_pid_ns_head;
+static DEFINE_MUTEX(sclock_thread_mutex);
+static DECLARE_WAIT_QUEUE_HEAD(sclock_thread_wait);
+static unsigned int sclock_thread_sleep_millisecs = 1000;
+static int do_ksm_page_count(struct page* page,struct pid_namespace* pid_ns_ref, pteval_t flags){
+	struct stable_node *stable_node;
+	struct rmap_item *rmap_item;
+	pte_t* pte,pte_entry;
+	int ret=0;	
+	struct mm_struct * mm;
+	struct task_struct * task;
+	unsigned long address;
+	stable_node = page_stable_node(page);
+	//printk("ksm\n");
+	if (!stable_node)
+	  return -1;
+	hlist_for_each_entry(rmap_item, &stable_node->hlist, hlist) {
+		struct anon_vma *anon_vma = rmap_item->anon_vma;
+		struct anon_vma_chain *vmac;
+		struct vm_area_struct *vma;
+		anon_vma_lock_read(anon_vma);
+		anon_vma_interval_tree_foreach(vmac, &anon_vma->rb_root,
+					0, ULONG_MAX) {
+			vma = vmac->vma;
+			address= page_address_in_vma(page, vma);
+			if((mm=vma->vm_mm))
+			  if((task=mm->owner))
+				if(ns_of_pid(task_pid(task))==pid_ns_ref){
+					pte=find_pte(vma->vm_mm,address);
+					if(pte){	
+						if(pte->pte&flags)
+						  ret++;
+					}
+				}
+		}	
+		anon_vma_unlock_read(anon_vma);
+	}
+	return ret;
+}
+static int do_file_page_count(struct page* page,struct pid_namespace* pid_ns_ref, pteval_t flags){
+	struct address_space *mapping = page->mapping;
+	pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
+	int ret=0;	struct vm_area_struct *vma;
+	unsigned long address;
+	struct mm_struct * mm;
+	struct task_struct * task;
+	pte_t* pte,pte_entry; 
+	//printk("file\n");
+	if (PageHuge(page))
+	  pgoff = page->index << compound_order(page);
+	mutex_lock(&mapping->i_mmap_mutex);
+	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
+		if(vma){
+			address = page_address_in_vma(page, vma);
+			if((mm=vma->vm_mm))
+			  if((task=mm->owner))
+				if(ns_of_pid(task_pid(task))==pid_ns_ref){
+					pte=find_pte(mm,address);
+					if(pte){	
+						if(pte->pte&flags)
+						  ret++;
+					}
+				}
+		}
+	}
+	mutex_unlock(&mapping->i_mmap_mutex);
+	return ret;
+}
+static int do_anon_page_count(struct page* page,struct pid_namespace* pid_ns_ref, pteval_t flags){
+	struct anon_vma * anon_vma;
+	int ret=0;
+	struct anon_vma_chain *avc;
+	pte_t* pte,pte_entry; 
+	unsigned long address;
+	pgoff_t pgoff;
+	struct mm_struct * mm;
+	struct task_struct * task;
+	struct vm_area_struct *vma;
+	//printk("anon\n");
+	anon_vma=page_lock_anon_vma_read(page);
+	if (!anon_vma)
+	  return ret;
+	pgoff=page->index<<(PAGE_CACHE_SHIFT-PAGE_SHIFT);
+	anon_vma_interval_tree_foreach(avc,&anon_vma->rb_root,pgoff,pgoff){
+		vma=avc->vma;
+		if(vma){
+			address = page_address_in_vma(page, vma);
+			if((mm=vma->vm_mm))
+			  if((task=mm->owner))
+				if(ns_of_pid(task_pid(task))==pid_ns_ref){
+					pte=find_pte(vma->vm_mm,address);
+					if(pte){	
+						if(pte->pte&flags)
+						  ret++;
+					}
+				}
+		}
+	}
+unlock:	page_unlock_anon_vma_read(anon_vma);
+		return ret;
+}
+void delete_bad_entry(struct spinlock_t* lock,struct scolor_LRU* scolor_entry){
+	spin_lock(lock);
+	list_del(&scolor_entry->scolor_lru);
+	kfree(scolor_entry);
+	spin_unlock(lock);
+
+}
+static int compare_scolor(void* priv,struct list_head* a,struct list_head* b){
+	struct scolor_LRU* a_entry,* b_entry;
+	int a_count,b_count;
+	a_entry=list_entry(a,struct scolor_LRU,scolor_lru);
+	b_entry=list_entry(b,struct scolor_LRU,scolor_lru);
+	a_count=atomic_read(&a_entry->access_times);
+	b_count=atomic_read(&b_entry->access_times);
+	if(a_count<b_count)
+	  return -1;
+	if(a_count==b_count)
+	  return 0;
+	return 1;
+}
+void sort_lru(struct list_head* lru_head){
+	list_sort(NULL,lru_head,compare_scolor);
+}
+static int do_sclock_scan(void){
+	struct pid_namespace* pid_ns;
+	struct scolor_LRU * scolor_entry,*n;
+	struct mm_struct* mm_one;
+	struct list_head* lru_head;
+	struct vm_area_struct* vma_one;
+	pte_t *pte_one,pte_entry;
+	int i;
+	int count;
+	struct page* page;
+	long address_one;
+	printk("start to scan--------------\n");
+/*	list_for_each_entry(pid_ns,&all_pid_ns_head,entry){
+		for(i=0;i<NPageColor;i++){
+			lru_head=&(pid_ns->scolor_lru[i]);
+			list_for_each_entry_safe(scolor_entry,n,lru_head,scolor_lru){
+				atomic_inc(&scolor_entry->access_times);
+				page=pfn_to_page(scolor_entry->pfn);
+				if(!page){
+					delete_bad_entry(pid_ns,scolor_entry);
+					continue;
+				}
+
+				if(page->flags&PAGE_FLAGS_CHECK_AT_PREP==0){
+					delete_bad_entry(&pid_ns->scolor_lock[i],scolor_entry);
+					continue;
+				}
+				if(!page_mapped(page)){
+					delete_bad_entry(&pid_ns->scolor_lock[i],scolor_entry);
+					continue;
+				}
+				if(page_mapcount(page)>0){
+					//printk("mapcount==%d\n",page_mapcount(page));
+					if(PageAnon(page)){
+						if((count=do_anon_page_count(page,pid_ns,_PAGE_CACHE_PROTECT))>0){
+							atomic_add(count,&scolor_entry->access_times);
+						}
+					}
+					else if(PageKsm(page)){
+						if((count=do_ksm_page_count(page,pid_ns,_PAGE_CACHE_PROTECT))>0){
+							atomic_add(count,&scolor_entry->access_times);
+						}
+					}	
+					else if(page_mapping(page)){
+						if((count=do_file_page_count(page,pid_ns,_PAGE_CACHE_PROTECT))>0){
+							atomic_add(count,&scolor_entry->access_times);
+						}				
+					}
+				}
+			}
+			spin_lock(&(pid_ns->scolor_lock[i]));
+			sort_lru(lru_head);
+			spin_unlock(&(pid_ns->scolor_lock[i]));
+		}
+	}*/
+return 0;
+}
+static int sclockd__thread(void *nothing)
+{
+	set_freezable();
+	set_user_nice(current, 5);
+	while (!kthread_should_stop()) {
+		mutex_lock(&sclock_thread_mutex);
+		if(update_protection_cache(0)>0){
+			do_sclock_scan();
+	 	}
+	 	mutex_unlock(&sclock_thread_mutex);
+	 	if(update_protection_cache(0)>0){
+	 		schedule_timeout_interruptible( msecs_to_jiffies(sclock_thread_sleep_millisecs));
+	 	}else{
+	 		wait_event_freezable(sclock_thread_wait,
+	 		                                 update_protection_cache(0)>0);
+	 	}
+	}
+	return 0;
+}
+
+static int __init sclockd_init(void){
+	struct task_struct * sclock_thread;
+	int err=0;
+	 sclock_thread = kthread_run(sclockd__thread, NULL, "sclockd");
+	if (IS_ERR(sclock_thread)) {
+               pr_err("sclock_thread: creating failed!\n");
+                 err = PTR_ERR(sclock_thread);
+         }
+	printk("creat sclockd_thread");
+        return err;
+}
+
+module_init(sclockd_init);

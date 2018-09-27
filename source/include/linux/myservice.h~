@@ -1,0 +1,21 @@
+#ifndef _LINUX_MYSERVICE_H
+#define _LINUX_MYSERVICE_H
+
+//#ifndef lockedPages
+//static struct lockedPage_struct *lockedPages=NULL;
+//#endif
+/*struct lockedPage_struct {
+           
+    void* key;  
+    pte_t entry;           
+    UT_hash_handle hh;
+};*/
+pte_t* find_pte(struct mm_struct* mm, long address);
+void do_anon_page_isolation(struct page* page);
+int do_copy_on_read(struct mm_struct *mm, struct vm_area_struct *vma,
+		    unsigned long address, unsigned int flags);
+void check_isolation(struct page* page);
+int do_mapped_page_isolation(struct page* page);
+
+
+ #endif
