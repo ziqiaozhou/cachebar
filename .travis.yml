@@ -18,14 +18,17 @@ script:
 - if [ -f ${CACHE}/.config ];then echo "exist .config";else make O=../build oldconfig;fi
 - rm .config*
 - if [[ -f ${CACHE}/touch_order.txt ]]; then
-  while fn in `cat ${CACHE}/touch_order.txt`; do
+  for fn in `cat ${CACHE}/touch_order.txt`; do
   touch $fn;
   done;
   fi
 - if [[ -f ${CACHE}/previous_git_commit.txt ]]; then
  read PREVIOUS_GIT_COMMIT < ${CACHE}/previous_git_commit.txt;
  changed_files=`git diff --name-only $PREVIOUS_GIT_COMMIT HEAD`; 
+ echo ${changed_files},${#changed_files};
+ if [ "${#changed_files}" -gt "0" ];then
  touch `echo $changed_files`;
+ fi
  fi
 
 - make O=../build -j$(nproc)
